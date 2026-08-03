@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Nextura Test Terminal</title>
+  <style>
+    :root{color-scheme:dark}body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0;background:#0b1020;color:#e6edf3}.wrap{max-width:980px;margin:auto;padding:20px}.card{background:#111827;border:1px solid #263247;border-radius:14px;padding:16px;margin-bottom:16px}label{display:block;margin:10px 0 6px;color:#9fb0c6}input,textarea,select,button{width:100%;box-sizing:border-box;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#fff;padding:12px}textarea{min-height:120px;resize:vertical}button{cursor:pointer;background:#2563eb;border:none;font-weight:700;margin-top:12px}button.secondary{background:#334155}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.out{white-space:pre-wrap;word-break:break-word;background:#020617;border:1px solid #1e293b;border-radius:10px;padding:14px;min-height:180px}.muted{color:#94a3b8;font-size:13px}.ok{color:#86efac}.err{color:#fca5a5}@media(max-width:700px){.row{grid-template-columns:1fr}}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Nextura Test Terminal</h1>
+  <p class="muted">Panel test ringan untuk health, models, chat, dan streaming. Jangan biarkan publik tanpa autentikasi setelah pengujian selesai.</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Base URL</label>
+        <input id="baseUrl" value="https://content-aloysia-redcore-3a1be9f7.koyeb.app" />
+      </div>
+      <div>
+        <label>API Key (opsional)</label>
+        <input id="apiKey" placeholder="Kosongkan jika auth dimatikan" />
+      </div>
+    </div>
+    <div class="row">
+      <button class="secondary" onclick="testHealth()">Test /health</button>
+      <button class="secondary" onclick="testModels()">Test /v1/models</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Model</label>
+    <select id="model">
+      <option>Nextura/cortexa-pro</option>
+      <option>Nextura/cortexa-max</option>
+      <option>Nextura/cortexa-code</option>
+    </select>
+
+    <label>Prompt</label>
+    <textarea id="prompt">Siapa kamu dan siapa yang membuatmu?</textarea>
+
+    <div class="row">
+      <button onclick="testChat(false)">Kirim Non-Streaming</button>
+      <button onclick="testChat(true)">Kirim Streaming</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="status" class="muted">Siap.</div>
+    <div id="output" class="out"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function headers(json = false) {
+  const h = {};
+  const key = $('apiKey').value.trim();
+  if (key) h.Authorization = `Bearer ${key}`;
+  if (json) h['Content-Type'] = 'application/json';
+  return h;
+}
+
+function url(path) {
+  return $('baseUrl').value.trim().replace(/\/+$/, '') + path;
+}
+
+function setStatus(text, ok = null) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = ok === true ? 'ok' : ok === false ? 'err' : 'muted';
+}
+
+function show(data) {
+  $('output').textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+}
+
+async function parseResponse(res) {
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+async function testHealth() {
+  setStatus('Memeriksa health...');
+  show('');
+  try {
+    const res = await fetch(url('/health'));
+    const data = await parseResponse(res);
+    setStatus(`HTTP ${res.status} ${res.statusText}`, res.ok);
+    show(data);
+  } catch (e) {
+    setStatus('Gagal terhubung', false);
+    show(String(e));
+  }
+}
+
+async function testModels() {
+  setStatus('Mengambil daftar model...');
+  show('');
+  try {
+    const res = await fetch(url('/v1/models'), { headers: headers(false) });
+    const data = await parseResponse(res);
+    setStatus(`HTTP ${res.status} ${res.statusText}`, res.ok);
+    show(data);
+  } catch (e) {
+    setStatus('Gagal terhubung', false);
+    show(String(e));
+  }
+}
+
+async function testChat(stream) {
+  setStatus(stream ? 'Streaming...' : 'Mengirim request...');
+  show('');
+
+  const body = {
+    model: $('model').value,
+    messages: [{ role: 'user', content: $('prompt').value }],
+    stream
+  };
+
+  try {
+    const res = await fetch(url('/v1/chat/completions'), {
+      method: 'POST',
+      headers: headers(true),
+      body: JSON.stringify(body)
+    });
+
+    if (!stream) {
+      const data = await parseResponse(res);
+      setStatus(`HTTP ${res.status} ${res.statusText}`, res.ok);
+      show(data);
+      return;
+    }
+
+    if (!res.ok || !res.body) {
+      const data = await parseResponse(res);
+      setStatus(`HTTP ${res.status} ${res.statusText}`, false);
+      show(data);
+      return;
+    }
+
+    setStatus(`HTTP ${res.status} streaming`, true);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let visible = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\n\n/);
+      buffer = blocks.pop() || '';
+
+      for (const block of blocks) {
+        const line = block.split(/\n/).find(x => x.startsWith('data:'));
+        if (!line) continue;
+        const raw = line.slice(5).trim();
+        if (raw === '[DONE]') continue;
+        try {
+          const json = JSON.parse(raw);
+          const delta = json?.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            visible += delta;
+            show(visible);
+          }
+        } catch {
+          visible += raw;
+          show(visible);
+        }
+      }
+    }
+
+    setStatus('Streaming selesai.', true);
+  } catch (e) {
+    setStatus('Gagal terhubung', false);
+    show(String(e));
+  }
+}
+</script>
+</body>
+</html>
