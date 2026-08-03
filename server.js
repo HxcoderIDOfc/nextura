@@ -4,7 +4,7 @@ import rateLimit from "@fastify/rate-limit";
 import crypto from "node:crypto";
 
 /* =========================================================
- * NEXTURA CORE v1.1.1
+ * NEXTURA CORE v1.2.0
  * ========================================================= */
 
 const app = Fastify({
@@ -116,6 +116,13 @@ const CONFIG = {
   deepThinking:
     String(
       process.env.ENABLE_DEEP_THINKING || "true"
+    ).toLowerCase() === "true",
+
+  // Enforcement identitas via model (bukan regex).
+  // Bisa dimatikan lewat env kalau perlu, tapi default aktif.
+  identityEnforcement:
+    String(
+      process.env.ENABLE_IDENTITY_ENFORCEMENT || "true"
     ).toLowerCase() === "true",
 
   maxOutputTokens: Number(
@@ -235,6 +242,42 @@ dapat dilihat melalui tautan berikut:
 
 ${CONFIG.locationUrl}
 `.trim();
+
+/* =========================================================
+ * IDENTITY ENFORCEMENT PROMPT (untuk model editor)
+ * ========================================================= */
+
+function buildIdentityEnforcementPrompt() {
+  return `
+Kamu adalah editor kepatuhan identitas untuk Nextura AI.
+
+Tugasmu: baca TEKS JAWABAN yang diberikan, lakukan analisis
+internal untuk menentukan apakah teks tersebut menyebut atau
+mengklaim identitas dirinya sebagai model/provider lain, misalnya
+MiniMax, MiniMax Bot, MiniMaxAI, ChatGPT, GPT, OpenAI, Claude,
+Anthropic, Gemini, Google, atau provider AI upstream lainnya —
+baik secara eksplisit (menyebut nama) maupun implisit (menyiratkan
+dibuat/dikembangkan oleh entitas tersebut).
+
+ATURAN OUTPUT:
+1. Jika TIDAK ADA pelanggaran identitas apa pun dalam teks,
+   kembalikan teks tersebut PERSIS APA ADANYA, tanpa perubahan
+   satu karakter pun.
+2. Jika ADA pelanggaran identitas, tulis ulang HANYA bagian yang
+   melanggar tersebut sehingga menjadi konsisten dengan identitas
+   resmi: nama AI adalah "Nextura AI", dikembangkan oleh
+   "${CONFIG.developer}", bagian dari keluarga model
+   "Nextura Cortexa". Jangan mengubah bagian lain dari jawaban
+   (konten teknis, contoh, format, daftar, bahasa, gaya penulisan)
+   kecuali klaim identitas yang melanggar.
+3. Jangan menambah kalimat baru yang tidak diminta, jangan
+   menambah disclaimer, jangan menambah komentar meta seperti
+   "berikut teks yang sudah diperbaiki".
+4. Balas HANYA dengan isi jawaban final (baik itu teks asli atau
+   hasil edit). Jangan bungkus dengan tanda kutip, jangan beri
+   prefix apa pun, jangan tampilkan proses berpikirmu.
+`.trim();
+}
 
 /* =========================================================
  * GENERAL HELPERS
@@ -773,6 +816,86 @@ async function callGonka(body, signal) {
 }
 
 /* =========================================================
+ * IDENTITY ENFORCEMENT (via model reasoning, bukan regex)
+ *
+ * Ide: kirim teks jawaban mentah ke model yang sama sebagai
+ * "editor kepatuhan" dengan instruksi tegas dan temperature 0.
+ * Model diminta menganalisis apakah ada pelanggaran identitas,
+ * lalu mengembalikan teks final (asli atau sudah diperbaiki).
+ * Lebih robust dibanding regex karena menangani variasi
+ * frasa/typo/konteks yang tidak bisa ditangkap pattern statis.
+ * ========================================================= */
+
+async function enforceIdentityWithModel(
+  rawText,
+  publicModel,
+  signal
+) {
+  if (!CONFIG.identityEnforcement) {
+    return rawText;
+  }
+
+  if (!rawText || !rawText.trim()) {
+    return rawText;
+  }
+
+  const upstreamModel =
+    publicModel === "Nextura/cortexa-code"
+      ? CONFIG.gonkaModelCode
+      : CONFIG.gonkaModelPro;
+
+  const reviewBody = {
+    model: upstreamModel,
+    stream: false,
+    temperature: 0,
+    max_tokens: CONFIG.maxOutputTokens,
+
+    messages: [
+      {
+        role: "system",
+        content: buildIdentityEnforcementPrompt()
+      },
+      {
+        role: "user",
+        content: `TEKS JAWABAN:\n"""\n${rawText}\n"""`
+      }
+    ]
+  };
+
+  try {
+    const response = await callGonka(
+      reviewBody,
+      signal
+    );
+
+    const data = await response.json();
+
+    const reviewed =
+      data?.choices?.[0]?.message?.content;
+
+    if (
+      typeof reviewed === "string" &&
+      reviewed.trim()
+    ) {
+      return removeHiddenReasoning(
+        reviewed.trim()
+      );
+    }
+
+    // Kalau reviewer tidak mengembalikan teks yang valid,
+    // fallback ke teks asli supaya jawaban tidak hilang.
+    return rawText;
+  } catch (error) {
+    app.log.warn(
+      { err: error },
+      "Identity enforcement pass gagal, menggunakan teks asli"
+    );
+
+    return rawText;
+  }
+}
+
+/* =========================================================
  * COMET VISION
  * ========================================================= */
 
@@ -938,7 +1061,8 @@ function createOpenAIResponse({
   upstream,
   publicModel,
   requestId,
-  providerRoute
+  providerRoute,
+  finalContent
 }) {
   const sourceChoice =
     upstream?.choices?.[0] || {};
@@ -966,9 +1090,7 @@ function createOpenAIResponse({
           content:
             sourceMessage.content === null
               ? null
-              : removeHiddenReasoning(
-                  sourceMessage.content || ""
-                ),
+              : finalContent,
 
           ...(Array.isArray(
             sourceMessage.tool_calls
@@ -1106,8 +1228,37 @@ async function readSSEStream(
 }
 
 /* =========================================================
- * OPENAI SSE STREAM
+ * OPENAI SSE STREAM (dengan identity enforcement)
+ *
+ * Karena editor identitas butuh teks UTUH (tidak bisa
+ * mengevaluasi potongan kalimat yang terpotong di tengah),
+ * kita:
+ *  1. Baca seluruh SSE upstream sambil menyaring hidden
+ *     reasoning dan MENGUMPULKAN teks lengkap + delta mentah
+ *     lain (tool_calls, finish_reason, usage).
+ *  2. Setelah upstream selesai, jalankan enforceIdentityWithModel
+ *     pada teks lengkap tersebut.
+ *  3. "Replay" hasil akhir ke client sebagai rangkaian SSE
+ *     chunk kecil-kecil supaya tetap terasa seperti streaming,
+ *     lalu kirim event-event non-teks (tool_calls, usage,
+ *     finish_reason) yang sudah terkumpul.
  * ========================================================= */
+
+function chunkTextForReplay(text, chunkSize = 24) {
+  const chunks = [];
+
+  for (
+    let index = 0;
+    index < text.length;
+    index += chunkSize
+  ) {
+    chunks.push(
+      text.slice(index, index + chunkSize)
+    );
+  }
+
+  return chunks;
+}
 
 async function streamGonkaAsOpenAI({
   upstream,
@@ -1137,9 +1288,17 @@ async function streamGonkaAsOpenAI({
   const reasoningFilter =
     new StreamingReasoningFilter();
 
-  let roleSent = false;
+  let collectedText = "";
+  let collectedToolCalls = null;
+  let finishReason = null;
+  let lastUsage = null;
+  let lastCreated = unixTime();
 
   try {
+    // Tahap 1: kumpulkan seluruh isi jawaban (setelah
+    // reasoning hidden disaring) tanpa langsung mengirim
+    // ke client, supaya enforcement identitas bisa jalan
+    // di atas teks yang utuh.
     await readSSEStream(
       upstream,
 
@@ -1157,9 +1316,16 @@ async function streamGonkaAsOpenAI({
           return;
         }
 
+        lastCreated = Number(
+          sourceChunk.created || lastCreated
+        );
+
+        if (sourceChunk.usage) {
+          lastUsage = sourceChunk.usage;
+        }
+
         const sourceChoice =
-          sourceChunk?.choices?.[0] ||
-          {};
+          sourceChunk?.choices?.[0] || {};
 
         const sourceDelta =
           sourceChoice?.delta || {};
@@ -1169,18 +1335,8 @@ async function streamGonkaAsOpenAI({
             sourceDelta.content || ""
           );
 
-        const nexturaDelta = {};
-
-        if (!roleSent) {
-          nexturaDelta.role =
-            "assistant";
-
-          roleSent = true;
-        }
-
         if (visibleContent) {
-          nexturaDelta.content =
-            visibleContent;
+          collectedText += visibleContent;
         }
 
         if (
@@ -1188,55 +1344,17 @@ async function streamGonkaAsOpenAI({
             sourceDelta.tool_calls
           )
         ) {
-          nexturaDelta.tool_calls =
-            sourceDelta.tool_calls;
+          collectedToolCalls =
+            collectedToolCalls || [];
+
+          collectedToolCalls.push(
+            ...sourceDelta.tool_calls
+          );
         }
 
-        const finishReason =
-          sourceChoice.finish_reason ||
-          null;
-
-        if (
-          Object.keys(
-            nexturaDelta
-          ).length > 0 ||
-          finishReason
-        ) {
-          const nexturaChunk = {
-            id: requestId,
-
-            object:
-              "chat.completion.chunk",
-
-            created: Number(
-              sourceChunk.created ||
-                unixTime()
-            ),
-
-            model: publicModel,
-
-            choices: [
-              {
-                index: 0,
-                delta:
-                  nexturaDelta,
-                finish_reason:
-                  finishReason
-              }
-            ]
-          };
-
-          if (sourceChunk.usage) {
-            nexturaChunk.usage =
-              normalizeUsage(
-                sourceChunk.usage
-              );
-          }
-
-          writeSSE(
-            reply.raw,
-            nexturaChunk
-          );
+        if (sourceChoice.finish_reason) {
+          finishReason =
+            sourceChoice.finish_reason;
         }
       }
     );
@@ -1245,32 +1363,111 @@ async function streamGonkaAsOpenAI({
       reasoningFilter.flush();
 
     if (remainingText) {
+      collectedText += remainingText;
+    }
+
+    // Tahap 2: jalankan enforcement identitas via model
+    // pada teks lengkap (kalau ada tool_calls tanpa teks,
+    // enforcement dilewati karena tidak ada yang perlu
+    // diperiksa).
+    const finalText = collectedText.trim()
+      ? await enforceIdentityWithModel(
+          collectedText,
+          publicModel,
+          upstream?.controllerSignal
+        )
+      : collectedText;
+
+    // Tahap 3: replay ke client sebagai SSE chunk.
+    let roleSent = false;
+    const textChunks = chunkTextForReplay(
+      finalText || ""
+    );
+
+    for (const piece of textChunks) {
+      const delta = {};
+
+      if (!roleSent) {
+        delta.role = "assistant";
+        roleSent = true;
+      }
+
+      delta.content = piece;
+
       writeSSE(reply.raw, {
         id: requestId,
-
-        object:
-          "chat.completion.chunk",
-
-        created: unixTime(),
-
+        object: "chat.completion.chunk",
+        created: lastCreated,
         model: publicModel,
 
         choices: [
           {
             index: 0,
-
-            delta: {
-              content:
-                remainingText
-            },
-
-            finish_reason:
-              null
+            delta,
+            finish_reason: null
           }
         ]
       });
     }
 
+    if (!roleSent) {
+      // Tidak ada teks sama sekali (mis. tool_calls saja),
+      // tetap kirim role assistant.
+      writeSSE(reply.raw, {
+        id: requestId,
+        object: "chat.completion.chunk",
+        created: lastCreated,
+        model: publicModel,
+
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null
+          }
+        ]
+      });
+    }
+
+    if (collectedToolCalls) {
+      writeSSE(reply.raw, {
+        id: requestId,
+        object: "chat.completion.chunk",
+        created: lastCreated,
+        model: publicModel,
+
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: collectedToolCalls
+            },
+            finish_reason: null
+          }
+        ]
+      });
+    }
+
+    const finalChunk = {
+      id: requestId,
+      object: "chat.completion.chunk",
+      created: lastCreated,
+      model: publicModel,
+
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: finishReason || "stop"
+        }
+      ]
+    };
+
+    if (lastUsage) {
+      finalChunk.usage = normalizeUsage(lastUsage);
+    }
+
+    writeSSE(reply.raw, finalChunk);
     writeSSE(reply.raw, "[DONE]");
   } catch (error) {
     writeSSE(reply.raw, {
@@ -1307,7 +1504,7 @@ async function streamGonkaAsOpenAI({
 app.get("/", async () => ({
   name: "Nextura Core",
   service: "nextura-core",
-  version: "1.1.1",
+  version: "1.2.0",
   developer: CONFIG.developer,
   status: "online",
 
@@ -1323,7 +1520,7 @@ app.get("/", async () => ({
 app.get("/health", async () => ({
   status: "ok",
   service: "nextura-core",
-  version: "1.1.1",
+  version: "1.2.0",
 
   uptime_seconds:
     Math.floor(process.uptime()),
@@ -1434,11 +1631,18 @@ app.post(
             controller.signal
           );
 
-        const answer =
+        const rawAnswer =
           removeHiddenReasoning(
             extractCometResponseText(
               cometResult
             )
+          );
+
+        const answer =
+          await enforceIdentityWithModel(
+            rawAnswer,
+            publicModel,
+            controller.signal
           );
 
         const usage =
@@ -1607,6 +1811,27 @@ app.post(
       const upstreamData =
         await upstreamResponse.json();
 
+      const rawContent =
+        upstreamData?.choices?.[0]?.message
+          ?.content;
+
+      let finalContent = rawContent;
+
+      if (
+        typeof rawContent === "string" &&
+        rawContent.trim()
+      ) {
+        const cleaned =
+          removeHiddenReasoning(rawContent);
+
+        finalContent =
+          await enforceIdentityWithModel(
+            cleaned,
+            publicModel,
+            controller.signal
+          );
+      }
+
       return reply
         .header(
           "X-Nextura-Request-Id",
@@ -1625,7 +1850,9 @@ app.post(
               publicModel ===
               "Nextura/cortexa-code"
                 ? "nextura-code"
-                : "nextura-core"
+                : "nextura-core",
+
+            finalContent
           })
         );
     } catch (error) {
@@ -2078,7 +2305,7 @@ try {
         "Nextura Core",
 
       version:
-        "1.1.1",
+        "1.2.0",
 
       port:
         CONFIG.port,
@@ -2092,7 +2319,10 @@ try {
         CONFIG.agentSearch,
 
       deepThinking:
-        CONFIG.deepThinking
+        CONFIG.deepThinking,
+
+      identityEnforcement:
+        CONFIG.identityEnforcement
     },
 
     "Nextura Core is running"
